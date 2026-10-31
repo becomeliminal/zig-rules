@@ -8,6 +8,15 @@ hashcheckers = sha256
 [Plugin "cc"]
 Target = //plugins:cc
 
+; go-rules builds test/cgo: Go with cgo on and binaries linked statically, as
+; a repo whose images hold Go binaries builds them. On a Mac, Go's C tools are
+; this plugin's toolchain (.plzconfig_darwin_*).
+[Plugin "go"]
+Target = //plugins:go
+GoTool = //third_party/go:toolchain|go
+CgoEnabled = true
+DefaultStatic = true
+
 ; The plugin under test, configured as a user's defaults would configure it.
 [Plugin "zig"]
 

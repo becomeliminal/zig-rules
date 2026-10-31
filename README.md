@@ -168,6 +168,10 @@ with an import-name override and `@embedFile`, `zig_test`, cross-compiling to
 each Linux target, a stripped binary free of build paths, C sources, a
 translated C library, static and shared libraries linked by C, a package
 pinned by hash, and `please_zig zon` end to end.
+`test/cgo` builds a Go binary with two cgo libraries, go-ethereum's secp256k1
+and libopus (from configure and make, through hraban/opus), statically linked:
+for the host, where it runs, and for `///linux_amd64`, which on a Mac is Go's
+cgo going through this plugin's toolchain (`.plzconfig_darwin_*`).
 CI runs them on Ubuntu and macOS for every pull request.
 
 ## Updating zig
