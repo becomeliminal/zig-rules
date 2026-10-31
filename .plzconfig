@@ -1,0 +1,33 @@
+[Please]
+Version = >=17.31.2
+
+[build]
+hashcheckers = sha256
+
+; cc-rules builds the C side of the tests in test/c.
+[Plugin "cc"]
+Target = //plugins:cc
+
+; The plugin under test, configured as a user's defaults would configure it.
+[Plugin "zig"]
+
+[PluginDefinition]
+name = zig
+
+[PluginConfig "zig_tool"]
+ConfigKey = ZigTool
+DefaultValue = //:toolchain|zig
+Help = The zig executable the rules compile with. Defaults to the zig this plugin pins for the host, by sha256.
+Inherit = true
+
+[PluginConfig "please_zig_tool"]
+ConfigKey = PleaseZigTool
+DefaultValue = //:please_zig
+Help = please_zig, the rules' helper and C toolchain. Defaults to the one this plugin builds from source with its own zig.
+Inherit = true
+
+[PluginConfig "default_libc"]
+ConfigKey = DefaultLibc
+DefaultValue = musl
+Help = The libc a Linux target links: musl (the default; fully static) or gnu (glibc, dynamically linked, as zig cannot link it statically).
+Inherit = true

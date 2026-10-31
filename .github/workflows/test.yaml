@@ -1,0 +1,63 @@
+# Runs every test on Linux and on macOS. Each host compiles for itself and
+# cross-compiles for Linux on amd64 and arm64 (test/lang), and the C tests
+# (test/c) link Zig with each host's own C compiler.
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.runner }}
+    name: test (${{ matrix.runner }})
+    steps:
+      - uses: actions/checkout@v4
+
+      # One cache directory on Linux and macOS, in the runner's temp
+      # directory: actions/cache refuses paths with '..', and the runner
+      # context isn't available to a job's env.
+      - name: Point Please's cache at the runner's temp directory
+        run: echo "PLZ_ARGS=-o cache.dir:$RUNNER_TEMP/plz-cache" >> "$GITHUB_ENV"
+
+      # Please's build cache and its own install, restored from the newest run
+      # on this OS and architecture and saved again after this one. Please's
+      # cache is keyed by each action's inputs, so a restored entry is only
+      # ever the output those inputs build: it saves time, and changes nothing.
+      - name: Restore Please's cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.please
+            ${{ runner.temp }}/plz-cache
+          key: plz-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: plz-${{ runner.os }}-${{ runner.arch }}-
+
+      # Please's sandbox runs build actions in unprivileged user namespaces,
+      # which Ubuntu 24.04's AppArmor refuses by default.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Test
+        run: ./pleasew test -p -v notice --log_file plz-out/log/test.log //...
+
+      - name: Archive logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.runner }}
+          path: plz-out/log
