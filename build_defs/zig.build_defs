@@ -34,10 +34,11 @@ _LIBCS = [
 ]
 
 # zig's shared cache, as please_zig finds it: plz-out/zig-cache in the repo
-# the action runs in, unless ZIG_CACHE_DIR names another. Shared, because zig
-# compiles parts of itself (translate-c, fetch) into it the first time each is
-# used, which takes a minute, and because its entries hold absolute paths.
-_SHARED_ZIG_CACHE = 'export ZIG_GLOBAL_CACHE_DIR="${ZIG_CACHE_DIR:-${TMP_DIR%%/plz-out/*}/plz-out/zig-cache}" ZIG_LOCAL_CACHE_DIR=$TMP_DIR/zig-local'
+# the action runs in, or the action's own when it runs elsewhere (remote
+# execution), unless ZIG_CACHE_DIR names another. Shared, because zig compiles
+# parts of itself (translate-c, fetch) into it the first time each is used,
+# which takes a minute, and because its entries hold absolute paths.
+_SHARED_ZIG_CACHE = 'case "$TMP_DIR" in */plz-out/*) ZIG_GLOBAL_CACHE_DIR="${TMP_DIR%%/plz-out/*}/plz-out/zig-cache" ;; *) ZIG_GLOBAL_CACHE_DIR="$TMP_DIR/zig-cache" ;; esac && export ZIG_GLOBAL_CACHE_DIR="${ZIG_CACHE_DIR:-$ZIG_GLOBAL_CACHE_DIR}" ZIG_LOCAL_CACHE_DIR=$TMP_DIR/zig-local'
 
 _MODES = [
     "debug",

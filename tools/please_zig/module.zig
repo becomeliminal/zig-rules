@@ -334,7 +334,7 @@ pub fn compileMain(init: std.process.Init, args: []const []const u8) !void {
     options.cc_includes = cc_includes.items;
     options.cc_links = cc_links.items;
     options.global_cache = cc.cacheDir(arena, env) catch |err| switch (err) {
-        error.NoCacheDir => std.process.fatal("TMP_DIR is not under plz-out; set ZIG_CACHE_DIR", .{}),
+        error.NoCacheDir => std.process.fatal("neither TMP_DIR nor ZIG_CACHE_DIR is set, so there is no directory for zig's cache", .{}),
         else => return err,
     };
     options.local_cache = try std.fmt.allocPrint(arena, "{s}/zig-local-cache", .{env.get("TMP_DIR") orelse "."});

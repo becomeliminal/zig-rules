@@ -71,9 +71,19 @@ zig_shared_library(
     test_only = True,
 )
 
+# A C program loads the shared library at run time and calls its export.
+c_binary(
+    name = "load_square",
+    srcs = ["load_square.c"],
+    test_only = True,
+)
+
 gentest(
     name = "shared_library_test",
-    data = {"lib": [":square_shared"]},
+    data = {
+        "lib": [":square_shared"],
+        "loader": [":load_square"],
+    },
     no_test_output = True,
-    test_cmd = "grep -a -q zig_square $(echo $DATA_LIB | tr ' ' '\\n' | grep -E '[.](so|dylib)$')",
+    test_cmd = "test \"$($DATA_LOADER $PWD/$(echo $DATA_LIB | tr ' ' '\\n' | grep -E '[.](so|dylib)$'))\" = 64",
 )

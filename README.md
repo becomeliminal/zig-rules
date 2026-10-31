@@ -153,7 +153,9 @@ from the root and hands it to zig as `--dep` and `-M` flags.
 zig caches libc and compiler-rt for each target, and compiles parts of itself
 (fetch, translate-c) the first time each is used, which takes a minute. Its
 cache only works where it was built (entries hold absolute paths), so every
-action shares one, at `plz-out/zig-cache`; `ZIG_CACHE_DIR` names another.
+local action shares one, at `plz-out/zig-cache`; `ZIG_CACHE_DIR` names another.
+An action run remotely has no repo to share with and gets its own, so it
+compiles those parts from cold: the same output, more slowly.
 
 ## Developing
 

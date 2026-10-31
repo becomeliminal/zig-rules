@@ -55,7 +55,7 @@ pub const Error = error{
     UnknownTargetPlatform,
     /// The action builds for a platform zig_targets does not name.
     NoTargetForPlatform,
-    /// TMP_DIR is not under plz-out and ZIG_CACHE_DIR is not set.
+    /// Neither TMP_DIR nor ZIG_CACHE_DIR is set.
     NoCacheDir,
 };
 
@@ -85,14 +85,16 @@ pub fn hostPlatform() Platform {
 
 /// zig's cache directory. zig compiles libc for a target the first time it
 /// links for it, which takes seconds, and its cache only works where it was
-/// built (its entries hold absolute paths), so every action shares one:
+/// built (its entries hold absolute paths), so every local action shares one:
 /// plz-out/zig-cache in the repo the action runs in, found from TMP_DIR, which
-/// Please sets under plz-out. ZIG_CACHE_DIR names another.
+/// Please sets under plz-out. An action run elsewhere (remote execution) has
+/// no repo to share with and gets its own, in TMP_DIR: the same output,
+/// compiled from cold. ZIG_CACHE_DIR names another.
 pub fn cacheDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) (Error || std.mem.Allocator.Error)![]const u8 {
     if (env.get("ZIG_CACHE_DIR")) |dir| return dir;
     const tmp = env.get("TMP_DIR") orelse return error.NoCacheDir;
     const marker = "/plz-out/";
-    const at = std.mem.indexOf(u8, tmp, marker) orelse return error.NoCacheDir;
+    const at = std.mem.indexOf(u8, tmp, marker) orelse return std.fmt.allocPrint(allocator, "{s}/zig-cache", .{tmp});
     return std.fmt.allocPrint(allocator, "{s}/plz-out/zig-cache", .{tmp[0..at]});
 }
 
@@ -194,7 +196,7 @@ pub fn run(init: std.process.Init, tool: Tool, args: []const []const u8) !void {
         }
     } else {
         const cache = cacheDir(arena, env) catch |err| switch (err) {
-            error.NoCacheDir => std.process.fatal("TMP_DIR \"{s}\" is not under plz-out; set ZIG_CACHE_DIR", .{env.get("TMP_DIR") orelse ""}),
+            error.NoCacheDir => std.process.fatal("neither TMP_DIR nor ZIG_CACHE_DIR is set, so there is no directory for zig's cache", .{}),
             else => return err,
         };
         try env.put("ZIG_GLOBAL_CACHE_DIR", cache);
@@ -390,12 +392,27 @@ test "cacheDir: ZIG_CACHE_DIR names another" {
     try std.testing.expectEqualStrings("/cache", got);
 }
 
-test "cacheDir: TMP_DIR outside plz-out is refused" {
+test "cacheDir: an action outside plz-out has its own" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    // GIVEN an action whose TMP_DIR is not under plz-out
-    var env = try testEnv(&.{.{ "TMP_DIR", "/tmp/x" }});
+    // GIVEN an action whose TMP_DIR is not under plz-out, as a remote one's is
+    var env = try testEnv(&.{.{ "TMP_DIR", "/worker/action" }});
+    defer env.deinit();
+
+    // WHEN zig's cache directory is chosen
+    const got = try cacheDir(arena.allocator(), &env);
+
+    // THEN it is in the action's own directory
+    try std.testing.expectEqualStrings("/worker/action/zig-cache", got);
+}
+
+test "cacheDir: no TMP_DIR is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // GIVEN an environment with neither TMP_DIR nor ZIG_CACHE_DIR
+    var env = try testEnv(&.{});
     defer env.deinit();
 
     // WHEN zig's cache directory is chosen
