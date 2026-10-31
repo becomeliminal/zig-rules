@@ -27,6 +27,14 @@ pub const Error = error{
     HashMismatch,
 };
 
+/// What resolving the fetched packages into rules can find wrong.
+pub const ResolveError = error{
+    /// A package depends on a hash no fetched package has.
+    UnknownDependency,
+    /// A second version's hash-suffixed target is already another's name.
+    TargetCollision,
+};
+
 /// Reads the name and dependencies a build.zig.zon declares.
 pub fn parse(gpa: std.mem.Allocator, arena: std.mem.Allocator, source: [:0]const u8) (Error || std.mem.Allocator.Error)!Declared {
     var tree = try std.zig.Ast.parse(gpa, source, .{ .mode = .zon });
@@ -95,6 +103,69 @@ pub const Package = struct {
     /// Targets of the packages this one depends on.
     deps: []const []const u8,
 };
+
+/// A package as fetched, before it has a target: what it is called, where its
+/// module most likely is, and the hashes of the packages it depends on.
+pub const Fetched = struct {
+    /// The package's own name, from its build.zig.zon; without one, the name
+    /// the first package to declare it gave it.
+    name: []const u8,
+    url: []const u8,
+    hash: []const u8,
+    /// Its module's root source, relative to the package, if one was found.
+    root: ?[]const u8,
+    dep_hashes: []const []const u8,
+};
+
+fn fetchedLessThan(_: void, a: Fetched, b: Fetched) bool {
+    return switch (std.mem.order(u8, a.name, b.name)) {
+        .lt => true,
+        .gt => false,
+        .eq => std.mem.order(u8, a.hash, b.hash) == .lt,
+    };
+}
+
+fn packageLessThan(_: void, a: Package, b: Package) bool {
+    return std.mem.order(u8, a.target, b.target) == .lt;
+}
+
+/// The rules for the fetched packages. Each package's target is its name; a
+/// second version of a name gets its hash's last 8 characters too. Names are
+/// given in order of name then hash, so the same packages always get the
+/// same targets. Each dependency is the target of the package with its hash,
+/// whatever name the package depending on it declared it by.
+pub fn resolve(arena: std.mem.Allocator, fetched: []const Fetched) (ResolveError || std.mem.Allocator.Error)![]const Package {
+    const sorted = try arena.dupe(Fetched, fetched);
+    std.mem.sort(Fetched, sorted, {}, fetchedLessThan);
+
+    var targets: std.StringHashMapUnmanaged(void) = .empty;
+    var target_by_hash: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (sorted) |package| {
+        var target = package.name;
+        if (targets.contains(target)) {
+            target = try std.fmt.allocPrint(arena, "{s}_{s}", .{ package.name, package.hash[package.hash.len -| 8..] });
+            if (targets.contains(target)) return error.TargetCollision;
+        }
+        try targets.put(arena, target, {});
+        try target_by_hash.put(arena, package.hash, target);
+    }
+
+    const packages = try arena.alloc(Package, sorted.len);
+    for (sorted, packages) |package, *out| {
+        const deps = try arena.alloc([]const u8, package.dep_hashes.len);
+        for (package.dep_hashes, deps) |hash, *dep| dep.* = target_by_hash.get(hash) orelse return error.UnknownDependency;
+        const modules: []const [2][]const u8 = if (package.root) |root| try arena.dupe([2][]const u8, &.{.{ package.name, root }}) else &.{};
+        out.* = .{
+            .target = target_by_hash.get(package.hash).?,
+            .url = package.url,
+            .hash = package.hash,
+            .modules = modules,
+            .deps = deps,
+        };
+    }
+    std.mem.sort(Package, packages, {}, packageLessThan);
+    return packages;
+}
 
 /// The zig_package rule for a package, as BUILD text.
 pub fn render(allocator: std.mem.Allocator, package: Package) std.mem.Allocator.Error![]const u8 {
@@ -192,10 +263,9 @@ pub fn zonMain(init: std.process.Init, args: []const []const u8) !void {
     try pending.appendSlice(arena, top.dependencies);
 
     // Packages by hash, so a package two others depend on is one rule.
-    var packages: std.StringArrayHashMapUnmanaged(Package) = .empty;
-    var targets: std.StringHashMapUnmanaged(void) = .empty;
+    var found: std.StringArrayHashMapUnmanaged(Fetched) = .empty;
     while (pending.pop()) |dep| {
-        if (packages.contains(dep.hash)) continue;
+        if (found.contains(dep.hash)) continue;
         var fetch_env = try init.environ_map.clone(arena);
         try fetch_env.put("ZIG_GLOBAL_CACHE_DIR", cache);
         try fetch_env.put("ZIG_LOCAL_CACHE_DIR", cache);
@@ -206,6 +276,7 @@ pub fn zonMain(init: std.process.Init, args: []const []const u8) !void {
         }
         const dir = try packageRoot(io, arena, cache, dep.hash);
 
+        var name = dep.name;
         var own_deps: []const Dependency = &.{};
         const package_zon = try std.fmt.allocPrint(arena, "{s}/build.zig.zon", .{dir});
         if (cwd.readFileAllocOptions(io, package_zon, arena, .unlimited, .of(u8), 0)) |source| {
@@ -214,37 +285,39 @@ pub fn zonMain(init: std.process.Init, args: []const []const u8) !void {
                 error.InvalidZon => std.process.fatal("{s}: its build.zig.zon is not one this understands", .{dep.url}),
                 else => return err,
             };
+            if (declared.name.len > 0) name = declared.name;
             own_deps = declared.dependencies;
             try pending.appendSlice(arena, declared.dependencies);
         } else |_| {}
 
-        var modules: std.ArrayList([2][]const u8) = .empty;
-        for (conventional_roots) |root| {
-            const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, root });
+        var root: ?[]const u8 = null;
+        for (conventional_roots) |candidate| {
+            const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, candidate });
             cwd.access(io, path, .{}) catch continue;
-            try modules.append(arena, .{ dep.name, root });
+            root = candidate;
             break;
         }
 
-        // One target per name; a second version of a name gets its hash.
-        var target = dep.name;
-        if (targets.contains(target)) target = try std.fmt.allocPrint(arena, "{s}_{s}", .{ dep.name, dep.hash[dep.hash.len - 8 ..] });
-        try targets.put(arena, target, {});
-
-        var dep_targets: std.ArrayList([]const u8) = .empty;
-        for (own_deps) |own| try dep_targets.append(arena, own.name);
-        try packages.put(arena, dep.hash, .{
-            .target = target,
+        const dep_hashes = try arena.alloc([]const u8, own_deps.len);
+        for (own_deps, dep_hashes) |own, *hash| hash.* = own.hash;
+        try found.put(arena, dep.hash, .{
+            .name = name,
             .url = dep.url,
             .hash = dep.hash,
-            .modules = modules.items,
-            .deps = dep_targets.items,
+            .root = root,
+            .dep_hashes = dep_hashes,
         });
     }
 
+    const packages = resolve(arena, found.values()) catch |err| switch (err) {
+        error.UnknownDependency => std.process.fatal("a package depends on a hash no fetched package has", .{}),
+        error.TargetCollision => std.process.fatal("two versions of a package would share a target name; rename one by hand", .{}),
+        else => return err,
+    };
+
     var text: std.ArrayList(u8) = .empty;
     try text.appendSlice(arena, "# Generated by please_zig zon from build.zig.zon. Each package is pinned by\n# its Zig hash, which zig_package checks with zig fetch.\nsubinclude(\"///zig//build_defs:zig\")\n");
-    for (packages.values()) |package| {
+    for (packages) |package| {
         try text.appendSlice(arena, "\n");
         try text.appendSlice(arena, try render(arena, package));
     }
@@ -356,4 +429,93 @@ test "render: a package's rule" {
         \\)
         \\
     , got);
+}
+
+test "resolve: two versions of a name, each depended on by its own dependent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // GIVEN a depending on foo 1 and b depending on foo 2
+    const fetched = [_]Fetched{
+        .{ .name = "a", .url = "a.tar.gz", .hash = "a-HASH", .root = "src/root.zig", .dep_hashes = &.{"foo-1.0.0-AAAAAAAA"} },
+        .{ .name = "b", .url = "b.tar.gz", .hash = "b-HASH", .root = "src/root.zig", .dep_hashes = &.{"foo-2.0.0-BBBBBBBB"} },
+        .{ .name = "foo", .url = "foo2.tar.gz", .hash = "foo-2.0.0-BBBBBBBB", .root = "src/root.zig", .dep_hashes = &.{} },
+        .{ .name = "foo", .url = "foo1.tar.gz", .hash = "foo-1.0.0-AAAAAAAA", .root = "src/root.zig", .dep_hashes = &.{} },
+    };
+
+    // WHEN they are resolved into rules
+    const got = try resolve(arena.allocator(), &fetched);
+
+    // THEN each version has its own target and each dependent the version it declared
+    try std.testing.expectEqualDeep(@as([]const Package, &.{
+        .{ .target = "a", .url = "a.tar.gz", .hash = "a-HASH", .modules = &.{.{ "a", "src/root.zig" }}, .deps = &.{"foo"} },
+        .{ .target = "b", .url = "b.tar.gz", .hash = "b-HASH", .modules = &.{.{ "b", "src/root.zig" }}, .deps = &.{"foo_BBBBBBBB"} },
+        .{ .target = "foo", .url = "foo1.tar.gz", .hash = "foo-1.0.0-AAAAAAAA", .modules = &.{.{ "foo", "src/root.zig" }}, .deps = &.{} },
+        .{ .target = "foo_BBBBBBBB", .url = "foo2.tar.gz", .hash = "foo-2.0.0-BBBBBBBB", .modules = &.{.{ "foo", "src/root.zig" }}, .deps = &.{} },
+    }), got);
+}
+
+test "resolve: the same targets whatever order the packages were fetched in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // GIVEN the two versions of foo, fetched in both orders
+    const v1: Fetched = .{ .name = "foo", .url = "foo1.tar.gz", .hash = "foo-1.0.0-AAAAAAAA", .root = null, .dep_hashes = &.{} };
+    const v2: Fetched = .{ .name = "foo", .url = "foo2.tar.gz", .hash = "foo-2.0.0-BBBBBBBB", .root = null, .dep_hashes = &.{} };
+
+    // WHEN each order is resolved
+    const first = try resolve(arena.allocator(), &.{ v1, v2 });
+    const second = try resolve(arena.allocator(), &.{ v2, v1 });
+
+    // THEN both give the same rules
+    try std.testing.expectEqualDeep(first, second);
+}
+
+test "resolve: one package declared under two names is one target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // GIVEN a and b both depending on one hash, whatever each called it
+    const fetched = [_]Fetched{
+        .{ .name = "a", .url = "a.tar.gz", .hash = "a-HASH", .root = null, .dep_hashes = &.{"foo-HASH"} },
+        .{ .name = "b", .url = "b.tar.gz", .hash = "b-HASH", .root = null, .dep_hashes = &.{"foo-HASH"} },
+        .{ .name = "foo", .url = "foo.tar.gz", .hash = "foo-HASH", .root = null, .dep_hashes = &.{} },
+    };
+
+    // WHEN they are resolved into rules
+    const got = try resolve(arena.allocator(), &fetched);
+
+    // THEN both depend on its one target
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"foo"}), got[0].deps);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"foo"}), got[1].deps);
+}
+
+test "resolve: a dependency no package has is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // GIVEN a package depending on a hash nothing fetched
+    const fetched = [_]Fetched{
+        .{ .name = "a", .url = "a.tar.gz", .hash = "a-HASH", .root = null, .dep_hashes = &.{"missing-HASH"} },
+    };
+
+    // WHEN it is resolved
+    // THEN it is refused
+    try std.testing.expectError(error.UnknownDependency, resolve(arena.allocator(), &fetched));
+}
+
+test "resolve: two versions whose suffixed targets would be the same are refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // GIVEN three versions of foo, the last two hashes ending alike
+    const fetched = [_]Fetched{
+        .{ .name = "foo", .url = "foo1.tar.gz", .hash = "foo-1-AAAAAAAA", .root = null, .dep_hashes = &.{} },
+        .{ .name = "foo", .url = "foo2.tar.gz", .hash = "foo-2-BBBBBBBB", .root = null, .dep_hashes = &.{} },
+        .{ .name = "foo", .url = "foo3.tar.gz", .hash = "foo-3-BBBBBBBB", .root = null, .dep_hashes = &.{} },
+    };
+
+    // WHEN they are resolved
+    // THEN it is refused rather than one target overwriting another
+    try std.testing.expectError(error.TargetCollision, resolve(arena.allocator(), &fetched));
 }

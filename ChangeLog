@@ -1,3 +1,10 @@
+Version 0.1.1
+-------------
+    * please_zig zon: a package's deps are the targets of the hashes it
+      depends on, not the names it declared them by, so two versions of one
+      package each reach their own dependents. Targets are given in order of
+      name then hash, so the output no longer depends on fetch order.
+
 Version 0.1.0
 -------------
     * First release: zig_library, zig_binary, zig_test, zig_static_library,
