@@ -1,0 +1,7 @@
+Version 0.1.0
+-------------
+    * First release: zig_library, zig_binary, zig_test, zig_static_library,
+      zig_shared_library, zig_c_library and zig_package, with please_zig
+      zon to write package rules from a build.zig.zon. A C toolchain over
+      zig (:toolchain) that cross-compiles for other plugins to use. Zig
+      0.17.0.

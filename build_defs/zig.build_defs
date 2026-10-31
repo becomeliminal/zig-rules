@@ -1,0 +1,666 @@
+"""Please rules for Zig.
+
+A Zig module is a root source file and what it imports. zig_library declares
+one; zig_binary, zig_test, zig_static_library and zig_shared_library compile
+one with everything it imports, transitively, as a single zig invocation.
+zig_c_library makes a C library's headers a module, and zig_package fetches a
+package by its Zig hash, as build.zig.zon pins it.
+
+A module is described by a manifest (please_zig manifest): its module name,
+unique in the build and taken from its label; the name it is imported by; its
+root file; and the modules it imports. A compile gathers every manifest
+(needs_transitive_deps) and hands the graph to zig (please_zig compile).
+
+Each rule compiles for the platform its package builds for: in
+///linux_amd64 it is x86_64-linux, wherever Please runs. Linux targets link
+musl, statically, unless the plugin's DefaultLibc is gnu. The opt
+configuration builds `-O safe` and strips, so a binary is the same bytes
+wherever it is built; dbg builds `-O debug` and keeps debug info.
+"""
+
+_ZIG_ARCH = {
+    "amd64": "x86_64",
+    "arm64": "aarch64",
+}
+
+_ZIG_OS = {
+    "darwin": "macos",
+    "linux": "linux",
+}
+
+_LIBCS = [
+    "gnu",
+    "musl",
+]
+
+# zig's shared cache, as please_zig finds it: plz-out/zig-cache in the repo
+# the action runs in, unless ZIG_CACHE_DIR names another. Shared, because zig
+# compiles parts of itself (translate-c, fetch) into it the first time each is
+# used, which takes a minute, and because its entries hold absolute paths.
+_SHARED_ZIG_CACHE = 'export ZIG_GLOBAL_CACHE_DIR="${ZIG_CACHE_DIR:-${TMP_DIR%%/plz-out/*}/plz-out/zig-cache}" ZIG_LOCAL_CACHE_DIR=$TMP_DIR/zig-local'
+
+_MODES = [
+    "debug",
+    "fast",
+    "safe",
+    "small",
+]
+
+def _target(rule:str, name:str):
+    """zig's -target for the platform this package builds for."""
+    if CONFIG.ARCH not in _ZIG_ARCH:
+        fail(f"{rule} {name}: no zig target for architecture {CONFIG.ARCH}; zig-rules builds for " + ", ".join(sorted(_ZIG_ARCH.keys())))
+    if CONFIG.OS not in _ZIG_OS:
+        fail(f"{rule} {name}: no zig target for {CONFIG.OS}; zig-rules builds for " + ", ".join(sorted(_ZIG_OS.keys())))
+    arch = _ZIG_ARCH[CONFIG.ARCH]
+    os = _ZIG_OS[CONFIG.OS]
+    if CONFIG.OS != "linux":
+        return f"{arch}-{os}"
+    libc = CONFIG.ZIG.DEFAULT_LIBC
+    if libc not in _LIBCS:
+        fail(f"{rule} {name}: the zig plugin's DefaultLibc is {libc}, not one of " + ", ".join(_LIBCS))
+    return f"{arch}-{os}-{libc}"
+
+def _module_name(name:str):
+    """A module's name in the build: its label, made an identifier. Unique,
+    because labels are."""
+    label = canonicalise(f":{name}")
+    for c in ["/", ":", ".", "-", "@", "#", "+"]:
+        label = label.replace(c, "_")
+    return label.lstrip("_")
+
+def _quote(arg:str):
+    return "'" + arg.replace("'", "'\\''") + "'"
+
+def _module(
+        name:str,
+        main:str,
+        root_in_main:str,
+        srcs:list,
+        deps:list,
+        import_name:str,
+        import_names:dict,
+        extra_srcs:list,
+        csrcs:list,
+        copts:list,
+        visibility:list,
+        test_only:bool,
+        labels:list=[]):
+    """A module: its manifest, and a filegroup of the manifest and its files,
+    which carries its deps to whatever compiles it. Returns the filegroup and
+    the manifest rule."""
+    root = "$SRCS_MAIN" + (f"/{root_in_main}" if root_in_main else "")
+    cmd = [
+        "$TOOLS_PZ manifest",
+        "--module " + _module_name(name),
+        "--import " + _quote(import_name),
+        "--root " + root,
+        "--out $OUT",
+    ]
+    if csrcs:
+        cmd += ["$(for c in $SRCS_C; do printf -- '--csrc %s ' \"$c\"; done)"]
+    cmd += ["--copt " + _quote(o) for o in copts]
+    for dep in deps:
+        override = _quote(import_names.get(dep, "-"))
+        cmd += [f"--dep {override} $(locations {dep}) --end"]
+
+    # A module named by a user is name; one inside another rule (a compile's
+    # root, a package's module) is already _name#part.
+    manifest_name = f"{name}_manifest" if "#" in name else f"_{name}#manifest"
+    manifest = build_rule(
+        name = manifest_name,
+        srcs = {
+            "c": csrcs,
+            "main": [main],
+        },
+        outs = [manifest_name.replace("#", ".").lstrip("_") + ".zigmod.json"],
+        cmd = " ".join(cmd),
+        test_only = test_only,
+        tools = {"pz": [CONFIG.ZIG.PLEASE_ZIG_TOOL]},
+        deps = deps,
+    )
+    module = filegroup(
+        name = name,
+        srcs = [manifest, main] + srcs + extra_srcs + csrcs,
+        labels = ["zig_module"] + labels,
+        test_only = test_only,
+        visibility = visibility,
+        deps = deps,
+    )
+    return module, manifest
+
+def zig_library(
+        name:str,
+        main:str,
+        srcs:list=[],
+        deps:list=[],
+        import_name:str=None,
+        import_names:dict={},
+        extra_srcs:list=[],
+        csrcs:list=[],
+        copts:list=[],
+        visibility:list=None,
+        test_only:bool=False):
+    """A Zig module, for others to import. It is not compiled on its own: Zig
+    compiles a program's modules together, so a binary, test or library that
+    depends on it compiles it.
+
+    Args:
+      name: Name of the rule.
+      main: The module's root source file.
+      srcs: Other Zig files it @imports by path.
+      deps: zig_library, zig_c_library and zig_package targets it imports, and
+        C libraries (cc_library, or anything with cc:ld: labels) it links.
+      import_name: The name others @import it by. Defaults to `name`.
+      import_names: A dependency's label to the name this module imports it
+        by, instead of its own import name.
+      extra_srcs: Other files it needs, such as files it @embedFiles.
+      csrcs: C sources compiled into the module.
+      copts: Flags for its C sources.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+    """
+    module, _ = _module(
+        name = name,
+        srcs = srcs,
+        copts = copts,
+        csrcs = csrcs,
+        extra_srcs = extra_srcs,
+        import_name = import_name or name,
+        import_names = import_names,
+        main = main,
+        root_in_main = "",
+        test_only = test_only,
+        visibility = visibility,
+        deps = deps,
+    )
+    return module
+
+def _cc_flags(own_labels:list):
+    """Before a compile runs: the include directories and archives of the C
+    libraries it links, from their cc:inc: and cc:ld: labels. A library's own
+    labels, which are for whatever links it, are not its inputs."""
+
+    def add_flags(name):
+        includes = [i for i in get_labels(name, "cc:inc:") if f"cc:inc:{i}" not in own_labels]
+        links = [l for l in get_labels(name, "cc:ld:") if f"cc:ld:{l}" not in own_labels]
+        extra = "".join([f" --cc-include {i}" for i in includes])
+        extra += "".join([" --cc-link " + _quote(l) for l in links])
+        if not extra:
+            return
+        for config in ["dbg", "opt"]:
+            set_command(name, config, get_command(name, config).replace("$TOOLS_PZ compile", "$TOOLS_PZ compile" + extra))
+
+    return add_flags
+
+def _compile(
+        rule:str,
+        name:str,
+        kind:str,
+        main:str,
+        srcs:list,
+        deps:list,
+        import_names:dict,
+        extra_srcs:list,
+        csrcs:list,
+        copts:list,
+        mode:str,
+        strip:bool,
+        link_libc:bool,
+        zigopts:list,
+        data:list,
+        outs:dict,
+        visibility:list,
+        test_only:bool,
+        labels:list,
+        test:bool=False):
+    if mode and mode not in _MODES:
+        fail(f"{rule} {name}: mode {mode} is not one of " + ", ".join(_MODES))
+    _, root = _module(
+        name = f"_{name}#root",
+        srcs = srcs,
+        copts = copts,
+        csrcs = csrcs,
+        extra_srcs = extra_srcs,
+        import_name = name,
+        import_names = import_names,
+        main = main,
+        root_in_main = "",
+        test_only = test_only,
+        visibility = None,
+        deps = deps,
+    )
+    target = _target(rule, name)
+
+    def command(config_mode:str, config_strip:bool):
+        cmd = [
+            "$TOOLS_PZ compile",
+            "--zig $TOOLS_ZIG",
+            f"--kind {kind}",
+            f"--root $(location {root})",
+            f"--target {target}",
+            f"--mode {config_mode}",
+            "--out $OUTS_BIN",
+        ]
+        if config_strip:
+            cmd += ["--strip"]
+        if link_libc:
+            cmd += ["--link-libc"]
+        if zigopts:
+            cmd += ["--"] + [_quote(o) for o in zigopts]
+        return " ".join(cmd)
+
+    return build_rule(
+        name = name,
+        srcs = {"files": [main] + srcs + extra_srcs + csrcs},
+        outs = outs,
+        binary = kind in ["exe", "test"],
+        building_description = "Compiling...",
+        cmd = {
+            "dbg": command(mode or "debug", False if strip == None else strip),
+            "opt": command(mode or "safe", True if strip == None else strip),
+        },
+        data = data,
+        labels = labels,
+        needs_transitive_deps = True,
+        no_test_output = test,
+        pre_build = _cc_flags(labels),
+        test = test,
+        test_cmd = "$TEST" if test else None,
+        test_only = test_only,
+        tools = {
+            "pz": [CONFIG.ZIG.PLEASE_ZIG_TOOL],
+            "zig": [CONFIG.ZIG.ZIG_TOOL],
+        },
+        visibility = visibility,
+        deps = [root] + deps,
+    )
+
+def zig_binary(
+        name:str,
+        main:str,
+        srcs:list=[],
+        deps:list=[],
+        import_names:dict={},
+        extra_srcs:list=[],
+        csrcs:list=[],
+        copts:list=[],
+        mode:str=None,
+        strip:bool=None,
+        link_libc:bool=False,
+        zigopts:list=[],
+        data:list=[],
+        visibility:list=None,
+        test_only:bool=False,
+        labels:list=[]):
+    """A Zig executable.
+
+    Args:
+      name: Name of the rule, and of the executable.
+      main: The root source file, with `pub fn main`.
+      srcs: Other Zig files it @imports by path.
+      deps: zig_library, zig_c_library and zig_package targets it imports, and
+        C libraries it links.
+      import_names: A dependency's label to the name it is imported by.
+      extra_srcs: Other files it needs, such as files it @embedFiles.
+      csrcs: C sources compiled into it.
+      copts: Flags for its C sources.
+      mode: zig's -O: debug, safe, fast or small. Defaults to safe in the opt
+        configuration and debug in dbg.
+      strip: Omit debug info. Defaults to True in opt, so the binary is the
+        same bytes wherever it is built, and False in dbg.
+      link_libc: Link libc even with no C sources or C libraries.
+      zigopts: More flags for zig, before the modules.
+      data: Files it needs at run time.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      labels: Labels for the rule.
+    """
+    return _compile(
+        name = name,
+        srcs = srcs,
+        outs = {"bin": [name]},
+        copts = copts,
+        csrcs = csrcs,
+        data = data,
+        extra_srcs = extra_srcs,
+        import_names = import_names,
+        kind = "exe",
+        labels = labels,
+        link_libc = link_libc,
+        main = main,
+        mode = mode,
+        rule = "zig_binary",
+        strip = strip,
+        test_only = test_only,
+        visibility = visibility,
+        zigopts = zigopts,
+        deps = deps,
+    )
+
+def zig_test(
+        name:str,
+        main:str,
+        srcs:list=[],
+        deps:list=[],
+        import_names:dict={},
+        extra_srcs:list=[],
+        csrcs:list=[],
+        copts:list=[],
+        mode:str=None,
+        link_libc:bool=False,
+        zigopts:list=[],
+        data:list=[],
+        visibility:list=None,
+        labels:list=[]):
+    """Zig's tests: every `test` block reachable from `main`, built with
+    `zig test` and run by Please, which owns its timeout and its result.
+
+    Args: as zig_binary.
+    """
+    return _compile(
+        name = name,
+        srcs = srcs,
+        outs = {"bin": [name]},
+        copts = copts,
+        csrcs = csrcs,
+        data = data,
+        extra_srcs = extra_srcs,
+        import_names = import_names,
+        kind = "test",
+        labels = labels,
+        link_libc = link_libc,
+        main = main,
+        mode = mode,
+        rule = "zig_test",
+        strip = False,
+        test = True,
+        test_only = True,
+        visibility = visibility,
+        zigopts = zigopts,
+        deps = deps,
+    )
+
+def _library(
+        rule:str,
+        name:str,
+        kind:str,
+        filename:str,
+        hdrs:list,
+        main:str,
+        srcs:list,
+        deps:list,
+        import_names:dict,
+        extra_srcs:list,
+        csrcs:list,
+        copts:list,
+        mode:str,
+        strip:bool,
+        zigopts:list,
+        visibility:list,
+        test_only:bool):
+    if not hdrs:
+        fail(f"{rule} {name}: give hdrs, the C header declaring its export functions; zig 0.17 does not write one (-femit-h does nothing)")
+    library = _compile(
+        name = f"_{name}#lib",
+        srcs = srcs,
+        outs = {"bin": [filename]},
+        copts = copts,
+        csrcs = csrcs,
+        data = [],
+        extra_srcs = extra_srcs,
+        import_names = import_names,
+        kind = kind,
+        labels = [],
+        link_libc = False,
+        main = main,
+        mode = mode,
+        rule = rule,
+        strip = strip,
+        test_only = test_only,
+        visibility = None,
+        zigopts = zigopts,
+        deps = deps,
+    )
+
+    # cc:ld: and cc:inc: labels are how a C, Go (cgo) or Rust target that
+    # depends on this one links it and finds its header.
+    package = package_name()
+    return filegroup(
+        name = name,
+        srcs = [library] + hdrs,
+        labels = [
+            f"cc:ld:{package}/{filename}",
+            f"cc:inc:{package}",
+        ],
+        test_only = test_only,
+        visibility = visibility,
+    )
+
+def zig_static_library(
+        name:str,
+        main:str,
+        hdrs:list,
+        srcs:list=[],
+        deps:list=[],
+        import_names:dict={},
+        extra_srcs:list=[],
+        csrcs:list=[],
+        copts:list=[],
+        mode:str=None,
+        strip:bool=None,
+        zigopts:list=[],
+        visibility:list=None,
+        test_only:bool=False):
+    """A static library of a Zig module's `export` functions, for C, Go
+    (cgo) or Rust to link: depending on it adds the library to their link and
+    its headers to their include path, as a cc_library would.
+
+    Args: as zig_binary, and
+      hdrs: The C headers declaring its export functions. Zig 0.17 does not
+        generate them.
+    """
+    return _library(
+        name = name,
+        srcs = srcs,
+        hdrs = hdrs,
+        copts = copts,
+        csrcs = csrcs,
+        extra_srcs = extra_srcs,
+        filename = f"lib{name}.a",
+        import_names = import_names,
+        kind = "lib",
+        main = main,
+        mode = mode,
+        rule = "zig_static_library",
+        strip = strip,
+        test_only = test_only,
+        visibility = visibility,
+        zigopts = zigopts,
+        deps = deps,
+    )
+
+def zig_shared_library(
+        name:str,
+        main:str,
+        hdrs:list,
+        srcs:list=[],
+        deps:list=[],
+        import_names:dict={},
+        extra_srcs:list=[],
+        csrcs:list=[],
+        copts:list=[],
+        mode:str=None,
+        strip:bool=None,
+        zigopts:list=[],
+        visibility:list=None,
+        test_only:bool=False):
+    """A shared library of a Zig module's `export` functions:
+    lib<name>.so on Linux, lib<name>.dylib on macOS.
+
+    Args: as zig_binary, and
+      hdrs: The C headers declaring its export functions.
+    """
+    extension = "dylib" if CONFIG.OS == "darwin" else "so"
+    return _library(
+        name = name,
+        srcs = srcs,
+        hdrs = hdrs,
+        copts = copts,
+        csrcs = csrcs,
+        extra_srcs = extra_srcs,
+        filename = f"lib{name}.{extension}",
+        import_names = import_names,
+        kind = "dylib",
+        main = main,
+        mode = mode,
+        rule = "zig_shared_library",
+        strip = strip,
+        test_only = test_only,
+        visibility = visibility,
+        zigopts = zigopts,
+        deps = deps,
+    )
+
+def zig_c_library(
+        name:str,
+        hdrs:list,
+        deps:list=[],
+        import_name:str=None,
+        copts:list=[],
+        visibility:list=None,
+        test_only:bool=False):
+    """A C library's headers as a Zig module, by zig translate-c: what
+    @cImport does, as a module others import by name.
+
+    Args:
+      name: Name of the rule.
+      hdrs: The headers to translate, as one translation unit, in order.
+      deps: The C libraries the headers belong to: their cc:inc: directories
+        are searched, and depending on this module links them.
+      import_name: The name others @import it by. Defaults to `name`.
+      copts: Flags for translate-c: -D, -I and the like.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+    """
+    target = _target("zig_c_library", name)
+    flags = " ".join([_quote(o) for o in copts])
+    translated = build_rule(
+        name = f"_{name}#translated",
+        srcs = hdrs,
+        outs = [f"{name}.zig"],
+        cmd = " && ".join([
+            _SHARED_ZIG_CACHE,
+            'for h in $SRCS; do printf "#include \\"%s\\"\\n" "$PWD/$h"; done > _hdrs.h',
+            f"$TOOLS_ZIG translate-c -target {target} -lc -I. {flags} _hdrs.h > $OUT",
+        ]),
+        needs_transitive_deps = True,
+        pre_build = _translate_c_includes,
+        test_only = test_only,
+        tools = {"zig": [CONFIG.ZIG.ZIG_TOOL]},
+        deps = deps,
+    )
+    module, _ = _module(
+        name = name,
+        srcs = [],
+        copts = [],
+        csrcs = [],
+        extra_srcs = [],
+        import_name = import_name or name,
+        import_names = {},
+        main = translated,
+        root_in_main = "",
+        test_only = test_only,
+        visibility = visibility,
+        deps = deps,
+    )
+    return module
+
+def _translate_c_includes(name):
+    includes = "".join([f" -I{i}" for i in get_labels(name, "cc:inc:")])
+    if includes:
+        set_command(name, get_command(name).replace("translate-c ", "translate-c" + includes + " "))
+
+def zig_package(
+        name:str,
+        hash:str,
+        url:str=None,
+        src:str=None,
+        modules:dict={},
+        deps:list=[],
+        visibility:list=["PUBLIC"],
+        test_only:bool=False):
+    """A Zig package, as build.zig.zon declares one, pinned by its Zig hash:
+    the archive is fetched, and `zig fetch` on it must compute `hash`, or the
+    build fails. `please_zig zon` writes these from a build.zig.zon.
+
+    Args:
+      name: Name of the rule.
+      url: Where the package's archive is.
+      src: The archive itself, instead of url: a file or a rule's output, for
+        a vendored package.
+      hash: Its Zig package hash, as build.zig.zon has it.
+      modules: Import name to the module's root file, relative to the
+        package. A package's build.zig declares its modules, which this
+        cannot read, so they are named here.
+      deps: zig_package targets the package's modules import.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+    """
+    if (url == None) == (src == None):
+        fail(f"zig_package {name}: give url or src, not both or neither")
+    archive = src or remote_file(
+        name = f"_{name}#archive",
+        out = basename(url.split("?")[0].rstrip("/")),
+        test_only = test_only,
+        # No sha256: the Zig hash is the pin, checked against what zig fetch
+        # computes from these bytes before anything uses them.
+        url = url,
+    )
+    where = url or src
+    fetched = build_rule(
+        name = f"_{name}#fetched",
+        srcs = [archive],
+        outs = [f"{name}_package"],
+        cmd = " && ".join([
+            _SHARED_ZIG_CACHE,
+            'got="$($TOOLS_ZIG fetch $SRCS)"',
+            f'if [ "$got" != "{hash}" ]; then echo "zig_package {name}: zig fetch computed $got from {where}, but the pinned hash is {hash}" >&2; exit 1; fi',
+            # zig keeps what it hashed under p/: a directory, or since 0.17
+            # an archive of one. The package's root is the shallowest
+            # directory in it with a build.zig.zon.
+            f"stored=$ZIG_GLOBAL_CACHE_DIR/p/{hash}",
+            "mkdir _pkg",
+            'if [ -d "$stored" ]; then cp -R "$stored/." _pkg/; elif [ -f "$stored.tar.gz" ]; then tar -xzf "$stored.tar.gz" -C _pkg; else echo "zig_package ' + name + ': zig fetch left nothing at $stored" >&2; exit 1; fi',
+            'root=""; for d in _pkg _pkg/* _pkg/*/*; do if [ -f "$d/build.zig.zon" ]; then root="$d"; break; fi; done',
+            'if [ -z "$root" ]; then echo "zig_package ' + name + ': no build.zig.zon in the package" >&2; exit 1; fi',
+            'cp -R "$root" $OUT',
+        ]),
+        test_only = test_only,
+        tools = {"zig": [CONFIG.ZIG.ZIG_TOOL]},
+    )
+    module_targets = []
+    for import_name, root in sorted(modules.items()):
+        module, _ = _module(
+            name = f"_{name}#{import_name}",
+            srcs = [],
+            copts = [],
+            csrcs = [],
+            extra_srcs = [],
+            import_name = import_name,
+            import_names = {},
+            main = fetched,
+            root_in_main = root,
+            test_only = test_only,
+            visibility = None,
+            deps = deps,
+        )
+        module_targets.append(module)
+    return filegroup(
+        name = name,
+        srcs = module_targets,
+        labels = ["zig_package"],
+        test_only = test_only,
+        visibility = visibility,
+        deps = deps,
+    )
