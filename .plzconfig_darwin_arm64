@@ -4,6 +4,10 @@
 ; build Go's C tools are this plugin's toolchain: the Mac's own tool for an
 ; action building for macOS, zig for one building for Linux. Go also links
 ; every static binary with its CCTool.
+;
+; macOS has no fully static binaries (no crt0.o), so a Mac's own Go binaries
+; link dynamically; .plzconfig_linux_* keeps the Linux subrepos static.
 [Plugin "go"]
 CCTool = //:toolchain|cc
 ARTool = //:toolchain|ar
+DefaultStatic = false
