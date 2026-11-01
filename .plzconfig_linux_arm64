@@ -1,0 +1,5 @@
+; Read on a linux host of this platform, and by the ///linux_* architecture
+; subrepo on any host. A Mac turns static linking off for its own binaries
+; (.plzconfig_darwin_*); Linux binaries stay static whatever the host.
+[Plugin "go"]
+DefaultStatic = true

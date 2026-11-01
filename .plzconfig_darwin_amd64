@@ -1,0 +1,20 @@
+; Macs only (Please reads .plzconfig_<os>_<arch> on a host of that platform).
+;
+; A Mac's own C compiler only targets macOS, so for test/cgo's ///linux_amd64
+; build every C tool is this plugin's toolchain: the Mac's own tool for an
+; action building for macOS, zig for one building for Linux. Go also links
+; every static binary with its CCTool, and go-rules' cgo_library compiles its C
+; with cc-rules' tools, so both plugins are set.
+;
+; macOS has no fully static binaries (no crt0.o), so a Mac's own Go binaries
+; link dynamically; .plzconfig_linux_* keeps the Linux subrepos static.
+[Plugin "go"]
+CCTool = //:toolchain|cc
+ARTool = //:toolchain|ar
+DefaultStatic = false
+
+[Plugin "cc"]
+CCTool = //:toolchain|cc
+CPPTool = //:toolchain|c++
+ARTool = //:toolchain|ar
+LDTool = //:toolchain|ld
