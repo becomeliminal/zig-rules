@@ -6,12 +6,14 @@
 ; every static binary with its CCTool, and go-rules' cgo_library compiles its C
 ; with cc-rules' tools, so both plugins are set.
 ;
-; macOS has no fully static binaries (no crt0.o), so a Mac's own Go binaries
-; link dynamically; .plzconfig_linux_* keeps the Linux subrepos static.
+; Go's DefaultStatic stays on, as .plzconfig sets it. macOS has no fully static
+; binaries, so for a Mac's own binaries the toolchain drops -static and they
+; link dynamically. Turning it off here would turn it off for ///linux_amd64
+; too: an architecture subrepo takes go-rules' DefaultStatic from the host's
+; config, and Go's internal linker cannot link a Linux cgo binary.
 [Plugin "go"]
 CCTool = //:toolchain|cc
 ARTool = //:toolchain|ar
-DefaultStatic = false
 
 [Plugin "cc"]
 CCTool = //:toolchain|cc

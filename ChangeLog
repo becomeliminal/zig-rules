@@ -1,3 +1,11 @@
+Version 0.1.2
+-------------
+    * On a Mac, the toolchain's cc and c++ drop -static for the Mac's own
+      binaries, which macOS cannot link statically. go-rules' DefaultStatic
+      can then stay on for a Mac: an architecture subrepo takes it from the
+      host's config, so turning it off on a Mac also left ///linux_* Go
+      binaries with only the standard library's cgo unlinkable.
+
 Version 0.1.1
 -------------
     * please_zig zon: a package's deps are the targets of the hashes it

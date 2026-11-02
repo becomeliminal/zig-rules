@@ -125,7 +125,12 @@ Each call reads the platform its action builds for: `GOOS`/`GOARCH` when Go
 set them, otherwise `OS`/`ARCH`, which Please sets on every action.
 
 - **Building for the host:** the host's own tool of that name runs, so a host
-  build is what it would be without this plugin.
+  build is what it would be without this plugin. On a Mac, `cc` and `c++`
+  drop `-static`: macOS has no static libc, so its linker refuses it, and a
+  Mac's own binaries link dynamically. Leave go-rules' `DefaultStatic` on
+  for a Mac: an architecture subrepo (`///linux_amd64`) takes it from the
+  host's config, not from its own `.plzconfig_linux_*`, so turning it off on
+  a Mac turns it off for the Linux binaries too.
 - **Building for Linux:** `zig cc -target <arch>-linux-musl` (or `zig ar`,
   `zig ld.lld`), linking musl statically.
 - **Any other platform:** the call fails, naming it.
@@ -171,7 +176,10 @@ pinned by hash, and `please_zig zon` end to end.
 `test/cgo` builds a Go binary with two cgo libraries, go-ethereum's secp256k1
 and libopus (from configure and make, through hraban/opus), statically linked:
 for the host, where it runs, and for `///linux_amd64`, which on a Mac is Go's
-cgo going through this plugin's toolchain (`.plzconfig_darwin_*`).
+cgo going through this plugin's toolchain (`.plzconfig_darwin_*`). A second
+binary has only the standard library's cgo (`net`, `os/user`): with no cgo
+library Go would link it with its own linker unless asked for a static one,
+and its linker cannot link a Linux cgo binary on a Mac.
 CI runs them on Ubuntu and macOS for every pull request.
 
 ## Updating zig
