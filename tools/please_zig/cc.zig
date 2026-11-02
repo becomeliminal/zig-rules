@@ -111,7 +111,20 @@ pub fn commands(
     zig: []const u8,
 ) (Error || std.mem.Allocator.Error)![]const []const []const u8 {
     if (target.eql(host)) {
-        const command = try std.mem.concat(allocator, []const u8, &.{ &.{@tagName(tool)}, args });
+        // macOS has no fully static binaries: Apple ships no static libc
+        // (crt0.o), so its linker refuses -static. A build that asks for one
+        // (go-rules' DefaultStatic, set for the Linux binaries a repo ships)
+        // gets what macOS can link, dynamically. A Mac's own binaries only
+        // ever run on Macs. Dropping it here, rather than turning static off
+        // in a Mac's config, keeps that config out of the Linux builds: an
+        // architecture subrepo (///linux_amd64) takes go-rules' DefaultStatic
+        // from the host's config, whatever its own .plzconfig_linux_* says.
+        var own_args: std.ArrayList([]const u8) = .empty;
+        for (args) |arg| {
+            if (std.mem.eql(u8, host.os, "darwin") and tool.compiles() and std.mem.eql(u8, arg, "-static")) continue;
+            try own_args.append(allocator, arg);
+        }
+        const command = try std.mem.concat(allocator, []const u8, &.{ &.{@tagName(tool)}, own_args.items });
         return allocator.dupe([]const []const u8, &.{command});
     }
     const key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ target.os, target.arch });
@@ -238,6 +251,36 @@ test "commands: the host's own tool when building for the host" {
 
     // THEN the Mac's own cc runs with the arguments as given, unsplit
     try std.testing.expectEqualDeep(@as([]const []const []const u8, &.{&.{ "cc", "-c", "a.c", "b.c" }}), got);
+}
+
+test "commands: a Mac links its own binaries without -static" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { tool: Tool, want: []const []const u8 }{
+        .{ .tool = .cc, .want = &.{ "cc", "-o", "main", "main.o", "-lpthread" } },
+        .{ .tool = .@"c++", .want = &.{ "c++", "-o", "main", "main.o", "-lpthread" } },
+    };
+    for (cases) |case| {
+        // GIVEN an action on a Mac building for the Mac
+        // WHEN please_zig is called to link with -static, as go-rules links a
+        // static binary
+        const got = try commands(arena.allocator(), case.tool, &.{ "-o", "main", "-static", "main.o", "-lpthread" }, test_mac, test_mac, test_zig);
+
+        // THEN the Mac's own tool links it with every other argument as given
+        try std.testing.expectEqualDeep(@as([]const []const []const u8, &.{case.want}), got);
+    }
+}
+
+test "commands: a Linux host keeps -static for its own binaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // GIVEN an action on linux/amd64 building for linux/amd64
+    // WHEN please_zig is called as cc to link with -static
+    const got = try commands(arena.allocator(), .cc, &.{ "-o", "main", "-static", "main.o" }, test_linux_amd64, test_linux_amd64, test_zig);
+
+    // THEN the host's cc links it statically, as asked
+    try std.testing.expectEqualDeep(@as([]const []const []const u8, &.{&.{ "cc", "-o", "main", "-static", "main.o" }}), got);
 }
 
 test "commands: zig compiles for Linux, with no sanitizer" {
